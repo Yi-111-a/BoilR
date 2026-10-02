@@ -63,6 +63,9 @@ pub struct MyEguiApp {
     pub(crate) disconnect_state: DisconnectState,
     pub(crate) rename_map: HashMap<u32, String>,
     pub(crate) current_edit: Option<u32>,
+    /// The in-progress text of the open rename editor, held on the app rather than in
+    /// `rename_map` so that nothing is recorded until the rename is confirmed.
+    pub(crate) rename_edit: String,
     pub(crate) platforms: Platforms,
 }
 
@@ -83,6 +86,7 @@ impl MyEguiApp {
             disconnect_state: DisconnectState::default(),
             rename_map: load_rename_map(),
             current_edit: Option::None,
+            rename_edit: String::new(),
             platforms,
         })
     }

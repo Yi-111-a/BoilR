@@ -8,7 +8,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::get_renames_file;
 use crate::platforms::ShortcutToImport;
-use crate::renames::apply_rename;
+use crate::renames::{apply_rename, seed_rename_edit};
 #[cfg(target_family = "unix")]
 use crate::steam::setup_proton_games;
 use crate::sync;
@@ -38,6 +38,18 @@ impl<T> FetchStatus<T> {
             FetchStatus::Fetched(_) => true,
         }
     }
+}
+
+/// One frame of the rename editor: draws the name field and the confirm button.
+///
+/// Split out of the Import tab so the field's binding can be driven in a test. `buffer` is the
+/// caller's own `String` and is written in place — that is the whole point of the function, since
+/// egui is immediate mode and `TextEdit` keeps no copy of the text, so a field bound to a value
+/// rebuilt each frame shows a keystroke for one frame and then drops it. The button's `Response`
+/// is returned so a caller can tell a click from a frame that only rendered.
+fn rename_editor_frame(ui: &mut egui::Ui, buffer: &mut String) -> egui::Response {
+    ui.text_edit_singleline(buffer).request_focus();
+    ui.button("Rename")
 }
 
 impl MyEguiApp {
@@ -78,26 +90,20 @@ impl MyEguiApp {
                                     let mut import_game = !self.settings.blacklisted_games.contains(&shortcut.app_id);
                                     ui.horizontal(|ui|{
                                         if self.current_edit == Option::Some(shortcut.app_id){
-                                            // The field stays bound to the map entry. egui is immediate
-                                            // mode: TextEdit writes each keystroke into the String it is
-                                            // handed and keeps no copy of the text, so a value rebuilt
-                                            // every frame shows a typed character for one frame and drops
-                                            // it on the next. The borrow of rename_map has to end before
-                                            // apply_rename takes the map, so the text is copied out on click.
-                                            let mut confirmed = None;
-                                            if let Some(new_name) = self.rename_map.get_mut(&shortcut.app_id){
-                                                ui.text_edit_singleline(new_name).request_focus();
-                                                if ui.button("Rename").clicked() {
-                                                    confirmed = Some(new_name.clone());
-                                                }
-                                            }
-                                            if let Some(name) = confirmed {
+                                            // The edit buffer lives on the app state, not in the map.
+                                            // egui is immediate mode: TextEdit writes each keystroke into
+                                            // the String it is handed and keeps no copy of the text, so
+                                            // the String has to outlive the frame for the keystroke to
+                                            // outlive it. Holding it here rather than in rename_map
+                                            // also means an editor that is walked away from leaves the
+                                            // map untouched, so an unconfirmed name is never recorded.
+                                            let clicked = rename_editor_frame(ui, &mut self.rename_edit).clicked();
+                                            if clicked {
+                                                let name = self.rename_edit.clone();
                                                 self.current_edit = Option::None;
-                                                // The editor is seeded with the launcher's own name so the
-                                                // field has text, so confirming without a change leaves a
-                                                // no-op entry in renames.json. apply_rename is the rule
-                                                // that drops it (#561), and it already reads an empty
-                                                // field as "remove", so there is no fallback here.
+                                                // apply_rename is the only rule for what renames.json
+                                                // holds: an empty field, or the launcher's own name,
+                                                // removes the entry instead of storing it (#561).
                                                 apply_rename(&mut self.rename_map, shortcut.app_id, &shortcut.app_name, &name);
                                                 let rename_file_path = get_renames_file();
                                                 let contents = serde_json::to_string(&self.rename_map);
@@ -111,7 +117,12 @@ impl MyEguiApp {
                                             let checkbox = egui::Checkbox::new(&mut import_game,name);
                                             let response = ui.add(checkbox);
                                             if response.double_clicked(){
-                                                self.rename_map.entry(shortcut.app_id).or_insert_with(|| shortcut.app_name.to_owned());
+                                                // Open on the recorded rename, or on the launcher's own
+                                                // name. Nothing goes into rename_map here: a confirm
+                                                // writes the whole map out, so a seed inserted now would
+                                                // be recorded by the next confirm even if this editor is
+                                                // abandoned (#561).
+                                                self.rename_edit = seed_rename_edit(&self.rename_map, shortcut.app_id, &shortcut.app_name);
                                                 self.current_edit = Option::Some(shortcut.app_id);
                                             }
                                             if response.clicked(){
@@ -235,78 +246,116 @@ where
 #[cfg(test)]
 mod rename_field_tests {
     use super::*;
-    use std::collections::HashMap;
 
-    /// One frame of the rename field. `bound_to_entry` picks the binding under test: the map entry
-    /// itself, which is what the Import tab uses, or a clone rebuilt each frame, which is what
-    /// happened when this was first routed through `apply_rename`. `typed` is delivered through
-    /// `RawInput` rather than `Context::input_mut`, because the next `run` starts from whatever input
-    /// it is handed and would discard anything queued in between frames.
-    fn rename_field_frame(
+    /// One frame of the real rename editor, as the Import tab calls it. `per_frame_rebuild`
+    /// picks the binding under test: the caller's own buffer, which is what the Import tab
+    /// passes, or a value cloned and dropped inside the frame, which is the bug this guards.
+    /// `typed` is delivered through `RawInput` rather than `Context::input_mut`, because the
+    /// next `run` starts from whatever input it is handed and discards anything queued in
+    /// between frames.
+    fn editor_frame(
         ctx: &egui::Context,
-        map: &mut HashMap<u32, String>,
-        app_id: u32,
-        bound_to_entry: bool,
+        buffer: &mut String,
+        per_frame_rebuild: bool,
         typed: Option<&str>,
-    ) {
+    ) -> (bool, egui::Rect) {
         let mut input: egui::RawInput = Default::default();
         if let Some(typed) = typed {
             input.events.push(egui::Event::Text(typed.to_owned()));
         }
+        let mut clicked = false;
+        let mut button = egui::Rect::ZERO;
         let _ = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                if bound_to_entry {
-                    if let Some(value) = map.get_mut(&app_id) {
-                        ui.text_edit_singleline(value).request_focus();
-                    }
-                } else if let Some(entry) = map.get(&app_id) {
-                    let mut edited = entry.clone();
-                    ui.text_edit_singleline(&mut edited).request_focus();
-                }
+                let response = if per_frame_rebuild {
+                    let mut rebuilt = buffer.clone();
+                    rename_editor_frame(ui, &mut rebuilt)
+                } else {
+                    rename_editor_frame(ui, buffer)
+                };
+                clicked = response.clicked();
+                button = response.rect;
             });
         });
+        (clicked, button)
     }
 
     /// egui is immediate mode: `TextEdit` writes each keystroke into the `String` it is handed and
-    /// keeps no copy of the text itself. So the field has to stay bound to the map entry — a value
-    /// rebuilt every frame shows a typed character for one frame and drops it on the next, which
-    /// leaves the only confirmable text being the seed the editor opens with.
+    /// keeps no copy of the text itself. So the buffer has to be state that outlives the frame.
+    /// Otherwise the field shows a keystroke for one frame and drops it on the next, which leaves
+    /// the only confirmable text being the name the editor opened with.
     #[test]
     fn typed_text_survives_into_the_next_frame() {
-        let mut map = HashMap::new();
-        map.insert(7, "Hades".to_string());
+        let mut buffer = "Hades".to_string();
         let ctx = egui::Context::default();
 
-        rename_field_frame(&ctx, &mut map, 7, true, None); // take focus
-        rename_field_frame(&ctx, &mut map, 7, true, Some(" II"));
-        assert_eq!(map.get(&7).map(String::as_str), Some("Hades II"));
+        editor_frame(&ctx, &mut buffer, false, None); // take focus
+        editor_frame(&ctx, &mut buffer, false, Some(" II"));
+        assert_eq!(buffer, "Hades II");
 
         // The next frame renders with no input at all; what was typed is still what the field holds.
-        rename_field_frame(&ctx, &mut map, 7, true, None);
+        editor_frame(&ctx, &mut buffer, false, None);
         assert_eq!(
-            map.get(&7).map(String::as_str),
-            Some("Hades II"),
+            buffer, "Hades II",
             "the field has to still hold what was typed on the following frame"
         );
     }
 
-    /// The regression this guards: bound to a per-frame clone, the keystroke is written into a value
-    /// that is dropped at the end of the frame, so the map entry never sees it and confirming the
-    /// rename can only ever record the seed.
+    /// The regression this guards: a buffer cloned and dropped inside the frame never keeps the
+    /// keystroke, so confirming can only ever record the name the editor opened with.
     #[test]
-    fn a_per_frame_clone_of_the_entry_loses_the_keystroke() {
-        let mut map = HashMap::new();
-        map.insert(7, "Hades".to_string());
+    fn a_per_frame_rebuild_loses_the_keystroke() {
+        let mut buffer = "Hades".to_string();
         let ctx = egui::Context::default();
 
-        rename_field_frame(&ctx, &mut map, 7, false, None);
-        rename_field_frame(&ctx, &mut map, 7, false, Some(" II"));
-        rename_field_frame(&ctx, &mut map, 7, false, None);
+        editor_frame(&ctx, &mut buffer, false, None);
+        editor_frame(&ctx, &mut buffer, true, Some(" II"));
+        editor_frame(&ctx, &mut buffer, false, None);
 
         assert_eq!(
-            map.get(&7).map(String::as_str),
-            Some("Hades"),
-            "a field bound to a per-frame clone cannot hold what was typed"
+            buffer, "Hades",
+            "a buffer rebuilt every frame cannot hold what was typed"
+        );
+    }
+
+    /// Clicking Rename returns the buffer as it stands after the keystrokes — the text that gets
+    /// recorded, read out of the buffer rather than out of the field's widget state.
+    #[test]
+    fn clicking_rename_returns_the_buffer_contents() {
+        let mut buffer = "Hades".to_string();
+        let ctx = egui::Context::default();
+
+        editor_frame(&ctx, &mut buffer, false, None); // take focus
+        editor_frame(&ctx, &mut buffer, false, Some(" II"));
+        let (clicked, rect) = editor_frame(&ctx, &mut buffer, false, None);
+        assert!(!clicked, "nothing is confirmed without a click");
+
+        let centre = rect.center();
+        let mut input: egui::RawInput = Default::default();
+        input.events.push(egui::Event::PointerMoved(centre));
+        input.events.push(egui::Event::PointerButton {
+            pos: centre,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        });
+        input.events.push(egui::Event::PointerButton {
+            pos: centre,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        });
+        let mut clicked = false;
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                clicked = rename_editor_frame(ui, &mut buffer).clicked();
+            });
+        });
+
+        assert!(clicked, "the click has to land on the Rename button");
+        assert_eq!(
+            buffer, "Hades II",
+            "and the text it records is what was typed"
         );
     }
 }

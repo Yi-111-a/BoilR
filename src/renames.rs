@@ -43,6 +43,20 @@ pub fn apply_rename(map: &mut HashMap<u32, String>, app_id: u32, original: &str,
     }
 }
 
+/// The text a rename editor should open with for `app_id`: the recorded rename if there is
+/// one, otherwise the launcher's own name so the field has something to edit.
+///
+/// Returned rather than inserted into `map`. Seeding the map itself would leave an entry behind
+/// for an editor that is opened and then abandoned, and because a confirm writes the whole map
+/// out, the next unrelated confirm would serialize that seed into `renames.json` as a no-op
+/// entry — the same record `apply_rename` exists to prevent (#561). The map is only ever
+/// changed by [`apply_rename`], on a confirmed rename.
+pub fn seed_rename_edit(map: &HashMap<u32, String>, app_id: u32, original: &str) -> String {
+    map.get(&app_id)
+        .cloned()
+        .unwrap_or_else(|| original.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,5 +109,30 @@ mod tests {
 
         assert!(!map.contains_key(&1));
         assert_eq!(map.len(), 2);
+    }
+
+    /// Opening the editor and walking away from it must leave nothing for the next
+    /// confirm to write. A confirm serializes the whole map, so an entry left behind by
+    /// an abandoned editor is recorded whether or not that game was ever renamed.
+    #[test]
+    fn seeding_the_editor_does_not_add_an_entry_to_the_map() {
+        let mut map = HashMap::new();
+        map.insert(1, "Hades II".to_string());
+
+        // Opened on a game that already has a rename: the field opens on that rename.
+        let seed = seed_rename_edit(&map, 1, "Hades");
+        assert_eq!(seed, "Hades II");
+
+        // Opened on a game with no rename yet, and then abandoned without confirming.
+        let seed = seed_rename_edit(&map, 2, "Motrix");
+        assert_eq!(seed, "Motrix", "an unrenamed game opens on its own name");
+        // ...and abandoned:
+        drop(seed);
+
+        assert_eq!(
+            map,
+            HashMap::from([(1, "Hades II".to_string())]),
+            "seeding the editor must not touch the map, or this is what the next confirm writes"
+        );
     }
 }
